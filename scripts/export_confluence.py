@@ -55,7 +55,8 @@ class ConfluenceExporter:
     """Handles Confluence API interaction and page export."""
 
     def __init__(self, base_url: str, username: str = "", api_token: str = "",
-                 personal_token: str = "", max_depth: int = -1, rate_limit_delay: float = 0.2):
+                 personal_token: str = "", max_depth: int = -1,
+                 rate_limit_delay: float = 0.2, force_server: bool = False):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.api_token = api_token
@@ -64,11 +65,17 @@ class ConfluenceExporter:
         self.rate_limit_delay = rate_limit_delay
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
-        self.is_cloud = self._detect_cloud()
+        self.is_cloud = self._detect_cloud(force_server)
         self._setup_auth()
 
-    def _detect_cloud(self) -> bool:
-        return "atlassian.net" in self.base_url
+    def _detect_cloud(self, force_server: bool = False) -> bool:
+        if force_server:
+            return False
+        if "atlassian.net" in self.base_url:
+            return True
+        if self.personal_token and not self.api_token:
+            return False
+        return "/wiki" in self.base_url
 
     def _setup_auth(self):
         if self.personal_token:
@@ -99,22 +106,35 @@ class ConfluenceExporter:
         return {}
 
     def _paginated_get(self, path: str, params: Optional[dict] = None) -> list:
-        """Fetch all results from a paginated v2 endpoint."""
+        """Fetch all results from a paginated endpoint (v1 offset or v2 cursor)."""
         results = []
         params = params or {}
         params.setdefault("limit", 50)
         while True:
             data = self._api_get(path, params)
-            results.extend(data.get("results", []))
+            batch = data.get("results", [])
+            results.extend(batch)
+
             next_link = data.get("_links", {}).get("next")
-            if not next_link:
-                break
-            parsed = urllib.parse.urlparse(next_link)
-            query_params = urllib.parse.parse_qs(parsed.query)
-            params["cursor"] = query_params.get("cursor", [None])[0]
-            if not params["cursor"]:
-                break
-            time.sleep(self.rate_limit_delay)
+            if next_link:
+                parsed = urllib.parse.urlparse(next_link)
+                query_params = urllib.parse.parse_qs(parsed.query)
+                cursor = query_params.get("cursor", [None])[0]
+                if cursor:
+                    params["cursor"] = cursor
+                    time.sleep(self.rate_limit_delay)
+                    continue
+
+            total_size = data.get("totalSize") or data.get("size")
+            start = data.get("start")
+            if start is not None and total_size is not None:
+                next_start = start + len(batch)
+                if next_start < total_size and len(batch) > 0:
+                    params["start"] = next_start
+                    time.sleep(self.rate_limit_delay)
+                    continue
+
+            break
         return results
 
     @staticmethod
@@ -203,9 +223,10 @@ class ConfluenceExporter:
 
         return root
 
-    def _build_tree_v1_recursive(self, page_id: str, depth: int = 0) -> PageNode:
+    def _build_tree_v1_recursive(self, page_id: str, depth: int = 0,
+                                  prefetched_page: Optional[dict] = None) -> PageNode:
         """Build a page tree recursively using v1 API (Server/DC)."""
-        page = self.get_page(page_id)
+        page = prefetched_page or self.get_page(page_id)
         node = PageNode(
             id=str(page.get("id", "")),
             title=page.get("title", "Untitled"),
@@ -221,7 +242,9 @@ class ConfluenceExporter:
         time.sleep(self.rate_limit_delay)
 
         for child in children:
-            child_node = self._build_tree_v1_recursive(str(child["id"]), depth + 1)
+            child_node = self._build_tree_v1_recursive(
+                str(child["id"]), depth + 1, prefetched_page=child
+            )
             child_node.parent_id = node.id
             node.children.append(child_node)
 
@@ -565,6 +588,8 @@ def main():
                         help="Only fetch page tree structure without content")
     parser.add_argument("--list-only", action="store_true",
                         help="Only output the page list as JSON (no content fetch)")
+    parser.add_argument("--force-server", action="store_true",
+                        help="Force Server/DC mode (use REST API v1 even for Cloud URLs)")
 
     args = parser.parse_args()
 
@@ -615,6 +640,7 @@ def main():
         personal_token=personal_token,
         max_depth=args.max_depth,
         rate_limit_delay=args.rate_limit,
+        force_server=args.force_server,
     )
 
     if args.list_only:
