@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.confluence-exports/
+.confluence-exports.json
+confluence-export-output/
+.env
