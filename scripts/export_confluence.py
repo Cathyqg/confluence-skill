@@ -56,7 +56,8 @@ class ConfluenceExporter:
 
     def __init__(self, base_url: str, username: str = "", api_token: str = "",
                  personal_token: str = "", max_depth: int = -1,
-                 rate_limit_delay: float = 0.2, force_server: bool = False):
+                 rate_limit_delay: float = 0.2, force_server: bool = False,
+                 insecure: bool = False):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.api_token = api_token
@@ -65,6 +66,10 @@ class ConfluenceExporter:
         self.rate_limit_delay = rate_limit_delay
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
+        if insecure:
+            self.session.verify = False
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.is_cloud = self._detect_cloud(force_server)
         self._setup_auth()
 
@@ -75,7 +80,18 @@ class ConfluenceExporter:
             return True
         if self.personal_token and not self.api_token:
             return False
-        return "/wiki" in self.base_url
+        if self.api_token and not "atlassian.net" in self.base_url:
+            return self._probe_v2_api()
+        return False
+
+    def _probe_v2_api(self) -> bool:
+        """Probe whether v2 API is available (Cloud) by checking a lightweight endpoint."""
+        try:
+            url = f"{self.base_url}/wiki/api/v2/spaces?limit=1"
+            resp = self.session.get(url, timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
 
     def _setup_auth(self):
         if self.personal_token:
@@ -173,7 +189,7 @@ class ConfluenceExporter:
         """Fetch all descendants using REST API v2 (Cloud)."""
         return self._paginated_get(
             f"/wiki/api/v2/pages/{page_id}/descendants",
-            params={"limit": 50}
+            params={"limit": 250}
         )
 
     def get_children_v1(self, page_id: str) -> list:
@@ -309,9 +325,23 @@ class ConfluenceExporter:
         if not html or not html.strip():
             return ""
 
+        code_blocks = []
+
+        def _replace_code_block(match):
+            full = match.group(0)
+            lang_match = re.search(r'ac:parameter\s+ac:name="language"[^>]*>([^<]+)<', full)
+            lang = lang_match.group(1).strip() if lang_match else ""
+            body_match = re.search(r'<ac:plain-text-body>\s*<!\[CDATA\[(.*?)\]\]>\s*</ac:plain-text-body>', full, re.DOTALL)
+            if not body_match:
+                body_match = re.search(r'<ac:plain-text-body>(.*?)</ac:plain-text-body>', full, re.DOTALL)
+            body = body_match.group(1) if body_match else ""
+            marker = f"CFLCODEBLK{len(code_blocks)}XEND"
+            code_blocks.append(f"```{lang}\n{body}\n```")
+            return f"<p>{marker}</p>"
+
         cleaned = re.sub(
             r'<ac:structured-macro[^>]*ac:name="(code|noformat)"[^>]*>.*?</ac:structured-macro>',
-            lambda m: m.group(0),
+            _replace_code_block,
             html,
             flags=re.DOTALL
         )
@@ -342,13 +372,18 @@ class ConfluenceExporter:
         cleaned = re.sub(r'</ri:[^>]*>', '', cleaned)
 
         result = md(cleaned, heading_style="ATX", bullets="-", strip=["img"])
+
+        for i, block in enumerate(code_blocks):
+            marker = f"CFLCODEBLK{i}XEND"
+            result = result.replace(marker, f"\n{block}\n")
+
         result = re.sub(r'\n{3,}', '\n\n', result)
         return result.strip()
 
-    def export(self, page_id: str) -> PageNode:
+    def build_tree(self, page_id: str, fetch_bodies: bool = True) -> PageNode:
         """
-        Export a page and all its descendants, returning the root PageNode
-        with body_markdown populated on every node.
+        Build the page tree. When fetch_bodies=True, also fetch and convert
+        page content to Markdown.
         """
         print(f"Fetching root page {page_id}...", file=sys.stderr)
         root_page = self.get_page(page_id)
@@ -361,14 +396,17 @@ class ConfluenceExporter:
             descendants = self.get_descendants_v2(page_id)
             print(f"Found {len(descendants)} descendants.", file=sys.stderr)
             tree = self._build_tree_v2(root_page, descendants)
-            self._fetch_bodies_for_tree(tree)
+            if fetch_bodies:
+                self._fetch_bodies_for_tree(tree)
         else:
             print("Using REST API v1 (Server/DC)...", file=sys.stderr)
             tree = self._build_tree_v1_recursive(page_id)
 
-        print("Converting HTML to Markdown...", file=sys.stderr)
-        for node in self._flatten_tree(tree):
-            node.body_markdown = self._html_to_markdown(node.body_html)
+        if fetch_bodies:
+            print("Converting HTML to Markdown...", file=sys.stderr)
+            for node in self._flatten_tree(tree):
+                node.body_markdown = self._html_to_markdown(node.body_html)
+                node.body_html = ""
 
         return tree
 
@@ -458,12 +496,12 @@ def generate_summary_md(root: PageNode) -> str:
 
 
 def _extract_first_paragraph(markdown_text: str) -> str:
-    """Extract the first meaningful paragraph from markdown text."""
+    """Extract the first meaningful text from markdown content."""
     if not markdown_text:
         return ""
     stripped = re.sub(r'^#{1,6}\s+.*$', '', markdown_text, flags=re.MULTILINE)
     stripped = re.sub(r'^>\s+.*$', '', stripped, flags=re.MULTILINE)
-    stripped = re.sub(r'^\s*[-*]\s+.*$', '', stripped, flags=re.MULTILINE)
+    stripped = re.sub(r'^```.*?^```', '', stripped, flags=re.MULTILINE | re.DOTALL)
     paragraphs = re.split(r'\n\s*\n', stripped.strip())
     for para in paragraphs:
         para = para.strip()
@@ -590,6 +628,8 @@ def main():
                         help="Only output the page list as JSON (no content fetch)")
     parser.add_argument("--force-server", action="store_true",
                         help="Force Server/DC mode (use REST API v1 even for Cloud URLs)")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Disable SSL certificate verification (for self-signed certs)")
 
     args = parser.parse_args()
 
@@ -641,27 +681,16 @@ def main():
         max_depth=args.max_depth,
         rate_limit_delay=args.rate_limit,
         force_server=args.force_server,
+        insecure=args.insecure,
     )
 
     if args.list_only:
-        print(f"Fetching page tree for page {page_id}...", file=sys.stderr)
-        root_page = exporter.get_page(page_id)
-        if exporter.is_cloud:
-            descendants = exporter.get_descendants_v2(page_id)
-            tree = exporter._build_tree_v2(root_page, descendants)
-        else:
-            tree = exporter._build_tree_v1_recursive(page_id)
+        tree = exporter.build_tree(page_id, fetch_bodies=False)
         print(generate_page_list_json(tree))
         return
 
     if args.dry_run:
-        print(f"[DRY RUN] Fetching page tree for page {page_id}...", file=sys.stderr)
-        root_page = exporter.get_page(page_id)
-        if exporter.is_cloud:
-            descendants = exporter.get_descendants_v2(page_id)
-            tree = exporter._build_tree_v2(root_page, descendants)
-        else:
-            tree = exporter._build_tree_v1_recursive(page_id)
+        tree = exporter.build_tree(page_id, fetch_bodies=False)
 
         def _print_tree(node, indent=0):
             print(f"{'  ' * indent}- [{node.id}] {node.title}")
@@ -673,7 +702,7 @@ def main():
         print(f"\nTotal pages: {len(exporter._flatten_tree(tree))}")
         return
 
-    tree = exporter.export(page_id)
+    tree = exporter.build_tree(page_id, fetch_bodies=True)
 
     output_dir = _resolve_output_dir(page_id, args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
